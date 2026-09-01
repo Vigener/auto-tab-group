@@ -47,8 +47,32 @@ async function checkSingleTabGroups(windowId) {
   }
 }
 
+// 新しいタブページ（Cmd+T や + ボタンなど）かどうかを判定
+function isNewTabPage(tab) {
+  const url = tab.pendingUrl || tab.url || "";
+  return (
+    url.startsWith("chrome://newtab") ||
+    url.startsWith("chrome://new-tab-page") ||
+    url.startsWith("chrome-search://") ||
+    url === "about:blank"
+  );
+}
+
 // 新規タブ作成リスナー（親タブから開かれた子タブを自動グループ化）
 chrome.tabs.onCreated.addListener(async (newTab) => {
+  // Cmd+T や + ボタンで開かれた新しいタブページはグループ化から除外
+  if (isNewTabPage(newTab)) {
+    // ブラウザの仕様等で既にグループ内に作成されていた場合はグループ外へ出す
+    if (newTab.id && newTab.groupId && newTab.groupId !== chrome.tabGroups.TAB_GROUP_ID_NONE) {
+      try {
+        await chrome.tabs.ungroup(newTab.id);
+      } catch (e) {
+        console.debug("Ungroup new tab error:", e);
+      }
+    }
+    return;
+  }
+
   // リンククリック等で作成されたタブ（openerTabIdが存在する）か判定
   if (!newTab.openerTabId || !newTab.id) {
     return;
