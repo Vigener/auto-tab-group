@@ -14,40 +14,75 @@ async function getSettings() {
   }
 }
 
-// タブIDごとの直前の所属グループIDを記録するMap（メモリキャッシュ）
-const tabGroupMap = new Map();
-
-// 起動時 / Service Worker 起動時に全タブの groupId を同期
-async function syncAllTabs() {
+// ==========================================
+// グループのタブ数トラッキング（session storage）
+// ==========================================
+// Service Worker のスリープ・再起動にも耐えるよう chrome.storage.session に保持
+async function getGroupCounts() {
   try {
-    const tabs = await chrome.tabs.query({});
-    for (const tab of tabs) {
-      tabGroupMap.set(tab.id, tab.groupId);
-    }
+    const data = await chrome.storage.session.get({ groupCounts: {} });
+    return data.groupCounts || {};
   } catch (e) {
-    console.debug("Sync tabs error:", e);
+    return {};
   }
 }
-syncAllTabs();
 
-// タブ作成時の groupId を記録
-chrome.tabs.onCreated.addListener((tab) => {
-  tabGroupMap.set(tab.id, tab.groupId);
+async function saveGroupCounts(counts) {
+  try {
+    await chrome.storage.session.set({ groupCounts: counts });
+  } catch (e) {
+    console.debug("Failed to save group counts:", e);
+  }
+}
+
+// 全グループのタブ数を最新化して保存
+async function updateAllGroupCounts() {
+  try {
+    const groups = await chrome.tabGroups.query({});
+    const counts = await getGroupCounts();
+    const currentGroupIds = new Set();
+
+    for (const group of groups) {
+      currentGroupIds.add(String(group.id));
+      const tabs = await chrome.tabs.query({ groupId: group.id });
+      counts[String(group.id)] = tabs.length;
+    }
+
+    // 存在しなくなったグループを削除
+    for (const id in counts) {
+      if (!currentGroupIds.has(id)) {
+        delete counts[id];
+      }
+    }
+
+    await saveGroupCounts(counts);
+  } catch (e) {
+    console.debug("Update group counts error:", e);
+  }
+}
+
+// 起動時に同期
+updateAllGroupCounts();
+
+// グループ作成・更新・削除イベント
+chrome.tabGroups.onCreated.addListener(() => updateAllGroupCounts());
+chrome.tabGroups.onRemoved.addListener((group) => {
+  getGroupCounts().then((counts) => {
+    delete counts[String(group.id)];
+    saveGroupCounts(counts);
+  });
 });
 
-// タブの groupId 変更を記録（手動グループ化や移動）
-chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+// タブのグループ変更（手動グループ化、ドラッグ移動等）
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (changeInfo.groupId !== undefined) {
-    tabGroupMap.set(tabId, changeInfo.groupId);
+    updateAllGroupCounts();
   }
 });
 
 // ==========================================
 // 1. リンククリックによる子タブ生成（グループ化）
 // ==========================================
-// webNavigation.onCreatedNavigationTarget は、
-// ページ内のリンククリック（Cmd+クリック等）や window.open によるタブ作成時のみ発火します。
-// （Cmd+T、+ボタン、保存されたグループの展開、タブ復元では発火しません）
 chrome.webNavigation.onCreatedNavigationTarget.addListener(async (details) => {
   const { sourceTabId, tabId } = details;
   if (!sourceTabId || !tabId) return;
@@ -70,8 +105,6 @@ chrome.webNavigation.onCreatedNavigationTarget.addListener(async (details) => {
       const groupId = await chrome.tabs.group({
         tabIds: [parentTab.id, childTab.id]
       });
-      tabGroupMap.set(parentTab.id, groupId);
-      tabGroupMap.set(childTab.id, groupId);
 
       // 自動グループ名付与がONの場合のみタイトルを設定
       if (settings.autoNameGroup && parentTab.title) {
@@ -89,8 +122,10 @@ chrome.webNavigation.onCreatedNavigationTarget.addListener(async (details) => {
         groupId: parentTab.groupId,
         tabIds: childTab.id
       });
-      tabGroupMap.set(childTab.id, parentTab.groupId);
     }
+
+    // タブ数を更新
+    await updateAllGroupCounts();
   } catch (error) {
     console.debug("Auto Tab Group navigation target error:", error);
   }
@@ -99,35 +134,34 @@ chrome.webNavigation.onCreatedNavigationTarget.addListener(async (details) => {
 // ==========================================
 // 2. タブが閉じられたときの 1タブグループ解除
 // ==========================================
-// タブが明示的に閉じられた（Cmd+W、xボタン等）ときのみ、
-// その閉じられたタブが属していた「特定のグループ」だけを検査して解除します。
-// （手動作成した1タブグループや、無関係な他のグループには一切干渉しません）
 chrome.tabs.onRemoved.addListener(async (tabId, removeInfo) => {
   if (removeInfo.isWindowClosing) return;
-
-  const targetGroupId = tabGroupMap.get(tabId);
-  tabGroupMap.delete(tabId);
-
-  // 閉じられたタブがグループに属していなかった場合は何もしない
-  if (!targetGroupId || targetGroupId === chrome.tabGroups.TAB_GROUP_ID_NONE) {
-    return;
-  }
 
   const settings = await getSettings();
   if (!settings.autoUngroupSingle) {
     return;
   }
 
-  // タブがブラウザ上で完全に破棄された後に、その特定グループの残りタブ数を確認
-  setTimeout(async () => {
-    try {
-      const tabsInGroup = await chrome.tabs.query({ groupId: targetGroupId });
-      if (tabsInGroup.length === 1) {
-        await chrome.tabs.ungroup(tabsInGroup[0].id);
-        tabGroupMap.set(tabsInGroup[0].id, chrome.tabGroups.TAB_GROUP_ID_NONE);
+  try {
+    const counts = await getGroupCounts();
+    const groups = await chrome.tabGroups.query({ windowId: removeInfo.windowId });
+
+    for (const group of groups) {
+      const tabs = await chrome.tabs.query({ groupId: group.id });
+      const currentCount = tabs.length;
+      const oldCount = counts[String(group.id)] || 0;
+
+      // 「直前まで2個以上あった」かつ「現在1個になった」場合のみグループを解除
+      if (oldCount >= 2 && currentCount === 1) {
+        await chrome.tabs.ungroup(tabs[0].id);
+        delete counts[String(group.id)];
+      } else {
+        counts[String(group.id)] = currentCount;
       }
-    } catch (e) {
-      console.debug("Single tab ungroup check error:", e);
     }
-  }, 100);
+
+    await saveGroupCounts(counts);
+  } catch (error) {
+    console.debug("Error during tab onRemoved check:", error);
+  }
 });
