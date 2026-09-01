@@ -1,12 +1,13 @@
 {
   "manifest_version": 3,
   "name": "Auto Tab Group",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Cmd+クリック等でリンクを開いた際、自動で親タブと同じグループにまとめます（Dia / Zen Browser風）。",
   "permissions": [
     "tabs",
     "tabGroups",
-    "storage"
+    "storage",
+    "webNavigation"
   ],
   "background": {
     "service_worker": "background.js"

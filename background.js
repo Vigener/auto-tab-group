@@ -14,75 +14,52 @@ async function getSettings() {
   }
 }
 
-// 1タブのみのグループをチェックして解除する関数
-let ungroupTimer = null;
-function scheduleSingleTabGroupCheck(windowId) {
-  if (ungroupTimer) {
-    clearTimeout(ungroupTimer);
-  }
-  ungroupTimer = setTimeout(() => {
-    checkSingleTabGroups(windowId);
-  }, 150);
-}
+// タブIDごとの直前の所属グループIDを記録するMap（メモリキャッシュ）
+const tabGroupMap = new Map();
 
-async function checkSingleTabGroups(windowId) {
-  const settings = await getSettings();
-  if (!settings.autoUngroupSingle) {
-    return;
+// 起動時 / Service Worker 起動時に全タブの groupId を同期
+async function syncAllTabs() {
+  try {
+    const tabs = await chrome.tabs.query({});
+    for (const tab of tabs) {
+      tabGroupMap.set(tab.id, tab.groupId);
+    }
+  } catch (e) {
+    console.debug("Sync tabs error:", e);
   }
+}
+syncAllTabs();
+
+// タブ作成時の groupId を記録
+chrome.tabs.onCreated.addListener((tab) => {
+  tabGroupMap.set(tab.id, tab.groupId);
+});
+
+// タブの groupId 変更を記録（手動グループ化や移動）
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (changeInfo.groupId !== undefined) {
+    tabGroupMap.set(tabId, changeInfo.groupId);
+  }
+});
+
+// ==========================================
+// 1. リンククリックによる子タブ生成（グループ化）
+// ==========================================
+// webNavigation.onCreatedNavigationTarget は、
+// ページ内のリンククリック（Cmd+クリック等）や window.open によるタブ作成時のみ発火します。
+// （Cmd+T、+ボタン、保存されたグループの展開、タブ復元では発火しません）
+chrome.webNavigation.onCreatedNavigationTarget.addListener(async (details) => {
+  const { sourceTabId, tabId } = details;
+  if (!sourceTabId || !tabId) return;
 
   try {
-    const query = windowId ? { windowId } : {};
-    const groups = await chrome.tabGroups.query(query);
+    const [parentTab, childTab] = await Promise.all([
+      chrome.tabs.get(sourceTabId).catch(() => null),
+      chrome.tabs.get(tabId).catch(() => null)
+    ]);
 
-    for (const group of groups) {
-      const tabs = await chrome.tabs.query({ groupId: group.id });
-      // グループ内のタブが1個だけになったらグループを解除
-      if (tabs.length === 1) {
-        await chrome.tabs.ungroup(tabs[0].id);
-      }
-    }
-  } catch (error) {
-    console.debug("Check single tab groups error:", error);
-  }
-}
-
-// 新しいタブページ（Cmd+T や + ボタンなど）かどうかを判定
-function isNewTabPage(tab) {
-  const url = tab.pendingUrl || tab.url || "";
-  return (
-    url.startsWith("chrome://newtab") ||
-    url.startsWith("chrome://new-tab-page") ||
-    url.startsWith("chrome-search://") ||
-    url === "about:blank"
-  );
-}
-
-// 新規タブ作成リスナー（親タブから開かれた子タブを自動グループ化）
-chrome.tabs.onCreated.addListener(async (newTab) => {
-  // Cmd+T や + ボタンで開かれた新しいタブページはグループ化から除外
-  if (isNewTabPage(newTab)) {
-    // ブラウザの仕様等で既にグループ内に作成されていた場合はグループ外へ出す
-    if (newTab.id && newTab.groupId && newTab.groupId !== chrome.tabGroups.TAB_GROUP_ID_NONE) {
-      try {
-        await chrome.tabs.ungroup(newTab.id);
-      } catch (e) {
-        console.debug("Ungroup new tab error:", e);
-      }
-    }
-    return;
-  }
-
-  // リンククリック等で作成されたタブ（openerTabIdが存在する）か判定
-  if (!newTab.openerTabId || !newTab.id) {
-    return;
-  }
-
-  try {
-    const parentTab = await chrome.tabs.get(newTab.openerTabId);
-
-    // 親タブが存在しない、または別ウィンドウ等の場合はスキップ
-    if (!parentTab || parentTab.windowId !== newTab.windowId) {
+    // 親タブまたは子タブが存在しない、別ウィンドウの場合はスキップ
+    if (!parentTab || !childTab || parentTab.windowId !== childTab.windowId) {
       return;
     }
 
@@ -91,8 +68,10 @@ chrome.tabs.onCreated.addListener(async (newTab) => {
     if (parentTab.groupId === chrome.tabGroups.TAB_GROUP_ID_NONE) {
       // 親タブがグループ未所属の場合: 親と子の両方を含む新しいグループを作成
       const groupId = await chrome.tabs.group({
-        tabIds: [parentTab.id, newTab.id]
+        tabIds: [parentTab.id, childTab.id]
       });
+      tabGroupMap.set(parentTab.id, groupId);
+      tabGroupMap.set(childTab.id, groupId);
 
       // 自動グループ名付与がONの場合のみタイトルを設定
       if (settings.autoNameGroup && parentTab.title) {
@@ -108,30 +87,47 @@ chrome.tabs.onCreated.addListener(async (newTab) => {
       // 親タブが既にグループ所属の場合: 既存グループに子タブを追加
       await chrome.tabs.group({
         groupId: parentTab.groupId,
-        tabIds: newTab.id
+        tabIds: childTab.id
       });
+      tabGroupMap.set(childTab.id, parentTab.groupId);
     }
   } catch (error) {
-    console.debug("Auto Tab Group processing error:", error);
+    console.debug("Auto Tab Group navigation target error:", error);
   }
 });
 
-// タブが閉じられたときのリスナー
-chrome.tabs.onRemoved.addListener((tabId, removeInfo) => {
-  if (!removeInfo.isWindowClosing) {
-    scheduleSingleTabGroupCheck(removeInfo.windowId);
+// ==========================================
+// 2. タブが閉じられたときの 1タブグループ解除
+// ==========================================
+// タブが明示的に閉じられた（Cmd+W、xボタン等）ときのみ、
+// その閉じられたタブが属していた「特定のグループ」だけを検査して解除します。
+// （手動作成した1タブグループや、無関係な他のグループには一切干渉しません）
+chrome.tabs.onRemoved.addListener(async (tabId, removeInfo) => {
+  if (removeInfo.isWindowClosing) return;
+
+  const targetGroupId = tabGroupMap.get(tabId);
+  tabGroupMap.delete(tabId);
+
+  // 閉じられたタブがグループに属していなかった場合は何もしない
+  if (!targetGroupId || targetGroupId === chrome.tabGroups.TAB_GROUP_ID_NONE) {
+    return;
   }
-});
 
-// タブの所属グループが変更されたときのリスナー（ドラッグで外に出された場合など）
-chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-  if (changeInfo.groupId !== undefined) {
-    scheduleSingleTabGroupCheck(tab.windowId);
+  const settings = await getSettings();
+  if (!settings.autoUngroupSingle) {
+    return;
   }
-});
 
-// タブが別ウィンドウへ移動（デタッチ）されたときのリスナー
-chrome.tabs.onDetached.addListener((tabId, detachInfo) => {
-  scheduleSingleTabGroupCheck(detachInfo.oldWindowId);
+  // タブがブラウザ上で完全に破棄された後に、その特定グループの残りタブ数を確認
+  setTimeout(async () => {
+    try {
+      const tabsInGroup = await chrome.tabs.query({ groupId: targetGroupId });
+      if (tabsInGroup.length === 1) {
+        await chrome.tabs.ungroup(tabsInGroup[0].id);
+        tabGroupMap.set(tabsInGroup[0].id, chrome.tabGroups.TAB_GROUP_ID_NONE);
+      }
+    } catch (e) {
+      console.debug("Single tab ungroup check error:", e);
+    }
+  }, 100);
 });
-
