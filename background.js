@@ -1,6 +1,7 @@
 // デフォルト設定
 const DEFAULT_SETTINGS = {
-  autoNameGroup: false // デフォルトは無名（DiaやZenのミニマルな外観に合わせる）
+  autoNameGroup: false,      // 親タイトルをグループ名に適用（デフォルト: OFF）
+  autoUngroupSingle: true    // 1タブのみになったらグループ解除（デフォルト: ON）
 };
 
 // 設定を取得するヘルパー関数
@@ -13,7 +14,40 @@ async function getSettings() {
   }
 }
 
-// 新規タブ作成リスナー
+// 1タブのみのグループをチェックして解除する関数
+let ungroupTimer = null;
+function scheduleSingleTabGroupCheck(windowId) {
+  if (ungroupTimer) {
+    clearTimeout(ungroupTimer);
+  }
+  ungroupTimer = setTimeout(() => {
+    checkSingleTabGroups(windowId);
+  }, 150);
+}
+
+async function checkSingleTabGroups(windowId) {
+  const settings = await getSettings();
+  if (!settings.autoUngroupSingle) {
+    return;
+  }
+
+  try {
+    const query = windowId ? { windowId } : {};
+    const groups = await chrome.tabGroups.query(query);
+
+    for (const group of groups) {
+      const tabs = await chrome.tabs.query({ groupId: group.id });
+      // グループ内のタブが1個だけになったらグループを解除
+      if (tabs.length === 1) {
+        await chrome.tabs.ungroup(tabs[0].id);
+      }
+    }
+  } catch (error) {
+    console.debug("Check single tab groups error:", error);
+  }
+}
+
+// 新規タブ作成リスナー（親タブから開かれた子タブを自動グループ化）
 chrome.tabs.onCreated.addListener(async (newTab) => {
   // リンククリック等で作成されたタブ（openerTabIdが存在する）か判定
   if (!newTab.openerTabId || !newTab.id) {
@@ -54,7 +88,26 @@ chrome.tabs.onCreated.addListener(async (newTab) => {
       });
     }
   } catch (error) {
-    // タブが即座に閉じられた場合などの一時的な例外をキャッチ
     console.debug("Auto Tab Group processing error:", error);
   }
 });
+
+// タブが閉じられたときのリスナー
+chrome.tabs.onRemoved.addListener((tabId, removeInfo) => {
+  if (!removeInfo.isWindowClosing) {
+    scheduleSingleTabGroupCheck(removeInfo.windowId);
+  }
+});
+
+// タブの所属グループが変更されたときのリスナー（ドラッグで外に出された場合など）
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (changeInfo.groupId !== undefined) {
+    scheduleSingleTabGroupCheck(tab.windowId);
+  }
+});
+
+// タブが別ウィンドウへ移動（デタッチ）されたときのリスナー
+chrome.tabs.onDetached.addListener((tabId, detachInfo) => {
+  scheduleSingleTabGroupCheck(detachInfo.oldWindowId);
+});
+
